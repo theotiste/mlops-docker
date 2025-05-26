@@ -33,6 +33,5 @@ jobs:
       run: |
         aws ecs update-service \
           --cluster mlops-cluster \
-          --service mlops-service \
+          --service mlops--service \
           --force-new-deployment
-cd..
