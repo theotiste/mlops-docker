@@ -5,6 +5,7 @@
   "cpu": "256",
   "memory": "512",
   "executionRoleArn": "arn:aws:iam::571600829584:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::571600829584:role/ecsTaskExecutionRole"
   "containerDefinitions": [
     {
       "name": "mlops-container",
