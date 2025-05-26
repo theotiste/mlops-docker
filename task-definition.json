@@ -1,0 +1,30 @@
+{
+  "family": "mlops-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::571600829584:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "mlops-container",
+      "image": "571600829584.dkr.ecr.eu-west-3.amazonaws.com/mlops-ecr-orch:latest",
+      "portMappings": [
+        {
+          "containerPort": 5000,
+          "hostPort": 5000,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/mlops-task",
+          "awslogs-region": "eu-west-3",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
