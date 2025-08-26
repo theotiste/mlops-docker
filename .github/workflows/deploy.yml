@@ -1,246 +1,247 @@
-name: Deploy to ECS (with Monitoring)
+name: Deploy to ECS
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
 
 concurrency:
-  group: ecs-deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: ecs-deploy
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: eu-west-3
+  CLUSTER: mlops-cluster
+  SERVICE: mlops--service
+  # Seuils (peuvent être surchargés en vars/secrets)
+  CPU_ALARM: "80"            # % CPU moyen du service
+  MEM_ALARM: "80"            # % mémoire moyenne du service
+  TG_5XX_THRESHOLD: "5"      # nb 5xx cibles / 5 min
+  ELB_5XX_THRESHOLD: "5"     # nb 5xx ELB / 5 min
+  LATENCY_P95_SEC: "1.5"     # p95 TargetResponseTime en secondes
+  UNHEALTHY_HOSTS: "1"       # hôtes cibles non sains max
+  LOG_RETENTION_DAYS: "14"   # rétention CloudWatch Logs
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # ===== Paramètres (modifie ici ou via Repository Variables/Secrets) =====
-    env:
-      AWS_REGION:           ${{ vars.AWS_REGION || 'eu-west-3' }}
-      CLUSTER:              ${{ vars.ECS_CLUSTER || 'mlops-cluster' }}
-      SERVICE:              ${{ vars.ECS_SERVICE || 'mlops--service' }}
-      TASK_DEF_FILE:        ${{ vars.ECS_TASK_DEF_FILE || 'task-definition.json' }}
-
-      # URL de santé exposée par ton service derrière l’ALB (facultatif mais conseillé)
-      HEALTH_URL:           ${{ secrets.HEALTH_URL || '' }}
-
-      # (facultatif) Log group CloudWatch à interroger (si tu utilises awslogs pour les tasks)
-      LOG_GROUP:            ${{ vars.LOG_GROUP || '' }}
-
-      # (facultatif) SNS pour recevoir les alarmes
-      SNS_TOPIC_ARN:        ${{ secrets.SNS_TOPIC_ARN || '' }}
-
-      # ===== Seuils d’alarme (ajuste à ton contexte) =====
-      ALARM_WINDOW_SEC:     300            # période 5 min
-      TG_5XX_THRESHOLD:     5              # erreurs 5xx cibles (Target 5XX) sur 5 min
-      ELB_5XX_THRESHOLD:    1              # erreurs 5xx ELB (optionnel)
-      LATENCY_P95_SEC:      1.0            # p95 TargetResponseTime en secondes
-      UNHEALTHY_HOSTS:      1              # hôtes non sains > X
-
-      CPU_WARN:             75
-      CPU_ALARM:            90
-      MEM_WARN:             75
-      MEM_ALARM:            90
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
+      - name: Install tools (jq)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
-      # Déploiement ECS (enregistre nouveau task def et met à jour le service)
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Déploiement ECS depuis un task-definition.json versionné
       - name: Deploy to Amazon ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition:            ${{ env.TASK_DEF_FILE }}
-          service:                    ${{ env.SERVICE }}
-          cluster:                    ${{ env.CLUSTER }}
+          task-definition: task-definition.json
+          service: ${{ env.SERVICE }}
+          cluster: ${{ env.CLUSTER }}
           wait-for-service-stability: true
 
-      # Découverte ALB/TargetGroup du service (pour alimenter les métriques ELB)
-      - name: Discover ALB & Target Group from service
+      # Découverte ALB/TargetGroup liés au service (si présents)
+      - name: Discover ALB/TargetGroup for service
         id: discover
         shell: bash
         run: |
           set -euo pipefail
-          DESCR=$(aws ecs describe-services \
-                   --cluster "${CLUSTER}" --services "${SERVICE}" \
-                   --query 'services[0]' --output json)
 
-          TG_ARN=$(jq -r '.loadBalancers[0].targetGroupArn // ""' <<<"$DESCR")
-          if [[ -z "$TG_ARN" ]]; then
-            echo "No TargetGroup found on the ECS service (service non attaché à un LB?)." >&2
-            echo "tg_dim=" >> "$GITHUB_OUTPUT"
-            echo "lb_dim=" >> "$GITHUB_OUTPUT"
+          # Récupère la définition du service
+          SVC_JSON=$(aws ecs describe-services \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}")
+
+          TG_ARN=$(echo "$SVC_JSON" | jq -r '.services[0].loadBalancers[0].targetGroupArn // empty')
+
+          if [[ -z "${TG_ARN}" || "${TG_ARN}" == "null" ]]; then
+            echo "tg_arn="
+            echo "lb_arn="
+            echo "lb_dim="
+            echo "tg_dim="
+            echo "has_alb=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Récupère l'ALB à partir du TG
-          LB_ARN=$(aws elbv2 describe-target-groups --target-group-arns "$TG_ARN" \
-                     --query 'TargetGroups[0].LoadBalancerArns[0]' --output text)
+          # LB ARN depuis le TargetGroup
+          LB_ARN=$(aws elbv2 describe-target-groups \
+            --target-group-arns "$TG_ARN" \
+            | jq -r '.TargetGroups[0].LoadBalancerArns[0]')
 
-          # Transforme ARN -> dimension CloudWatch (ex: app/name/hash  &  targetgroup/name/hash)
-          TG_DIM=${TG_ARN#*:targetgroup/}       # garde "targetgroup/..../hash" si besoin
-          TG_DIM="targetgroup/${TG_DIM#*/}"     # force le préfixe (utile selon ARN)
-          LB_DIM=${LB_ARN#*:loadbalancer/}      # "app/name/hash" ou "net/name/hash"
+          # Dimensions CloudWatch attendues (après loadbalancer/ et targetgroup/)
+          LB_DIM=$(echo "$LB_ARN" | sed -E 's#^arn:aws:elasticloadbalancing:[^:]+:[0-9]+:loadbalancer/##')
+          TG_DIM=$(echo "$TG_ARN" | sed -E 's#^arn:aws:elasticloadbalancing:[^:]+:[0-9]+:targetgroup/##')
 
-          echo "tg_dim=$TG_DIM" >> "$GITHUB_OUTPUT"
-          echo "lb_dim=$LB_DIM" >> "$GITHUB_OUTPUT"
+          {
+            echo "has_alb=true"
+            echo "tg_arn=$TG_ARN"
+            echo "lb_arn=$LB_ARN"
+            echo "lb_dim=$LB_DIM"
+            echo "tg_dim=$TG_DIM"
+          } >> "$GITHUB_OUTPUT"
 
-      # Création / mise à jour des alarmes CloudWatch (ALB + ECS CPU/Mem)
-      - name: Create/Update CloudWatch alarms
-        if: always()
-        shell: bash
-        env:
-          LB_DIM: ${{ steps.discover.outputs.lb_dim }}
-          TG_DIM: ${{ steps.discover.outputs.tg_dim }}
+      # Rétention des logs (facultatif) : /ecs/<service>
+      - name: Enforce CloudWatch Logs retention
         run: |
           set -euo pipefail
-          A() { aws cloudwatch put-metric-alarm "$@"; }
-
-          ARGS_COMMON=( --evaluation-periods 1 --treat-missing-data notBreaching \
-                        --period "${ALARM_WINDOW_SEC}" --comparison-operator GreaterThanThreshold )
-
-          # ===== Alarms ALB (si on a LB/TG) =====
-          if [[ -n "${LB_DIM:-}" && -n "${TG_DIM:-}" ]]; then
-            # Target 5XX
-            A --alarm-name "${SERVICE}-tg5xx" \
-              --namespace AWS/ELB --metric-name HTTPCode_Target_5XX_Count \
-              --statistic Sum --threshold "${TG_5XX_THRESHOLD}" \
-              --dimensions Name=LoadBalancer,Value="${LB_DIM}" Name=TargetGroup,Value="${TG_DIM}" \
-              "${ARGS_COMMON[@]}" \
-              $( [[ -n "$SNS_TOPIC_ARN" ]] && echo --alarm-actions "$SNS_TOPIC_ARN" )
-
-            # (optionnel) ELB 5XX
-            A --alarm-name "${SERVICE}-elb5xx" \
-              --namespace AWS/ELB --metric-name HTTPCode_ELB_5XX_Count \
-              --statistic Sum --threshold "${ELB_5XX_THRESHOLD}" \
-              --dimensions Name=LoadBalancer,Value="${LB_DIM}" \
-              "${ARGS_COMMON[@]}" \
-              $( [[ -n "$SNS_TOPIC_ARN" ]] && echo --alarm-actions "$SNS_TOPIC_ARN" )
-
-            # p95 Latency (TargetResponseTime en secondes)
-            A --alarm-name "${SERVICE}-latency-p95" \
-              --namespace AWS/ELB --metric-name TargetResponseTime \
-              --extended-statistics p95 --threshold "${LATENCY_P95_SEC}" \
-              --dimensions Name=LoadBalancer,Value="${LB_DIM}" Name=TargetGroup,Value="${TG_DIM}" \
-              "${ARGS_COMMON[@]}" \
-              $( [[ -n "$SNS_TOPIC_ARN" ]] && echo --alarm-actions "$SNS_TOPIC_ARN" )
-
-            # UnHealthy hosts
-            A --alarm-name "${SERVICE}-unhealthy-hosts" \
-              --namespace AWS/ELB --metric-name UnHealthyHostCount \
-              --statistic Maximum --threshold "${UNHEALTHY_HOSTS}" \
-              --dimensions Name=TargetGroup,Value="${TG_DIM}" Name=LoadBalancer,Value="${LB_DIM}" \
-              "${ARGS_COMMON[@]}" \
-              $( [[ -n "$SNS_TOPIC_ARN" ]] && echo --alarm-actions "$SNS_TOPIC_ARN" )
+          LOG_GROUP="/ecs/${SERVICE}"
+          if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query "logGroups[?logGroupName=='${LOG_GROUP}'] | length(@)" --output text | grep -q '^1$'; then
+            aws logs put-retention-policy \
+              --log-group-name "$LOG_GROUP" \
+              --retention-in-days "${LOG_RETENTION_DAYS}"
+            echo "Retention set to ${LOG_RETENTION_DAYS}d for ${LOG_GROUP}"
           else
-            echo "Skipping ALB alarms (no LB/TG discovered)."
+            echo "Log group ${LOG_GROUP} not found (skipping)."
           fi
 
-          # ===== Alarms ECS service CPU/Mem =====
-          # WARNING & ALARM séparées (tu peux ne garder que *-alarm* si tu préfères)
-          for what in CPUUtilization MemoryUtilization; do
-            TH_WARN="${what/Utilization/_WARN}"
-            TH_ALRM="${what/Utilization/_ALARM}"
-
-            WARN=${!TH_WARN:-80}
-            ALRM=${!TH_ALRM:-95}
-
-            # warning
-            A --alarm-name "${SERVICE}-${what,,}-warn" \
-              --namespace AWS/ECS --metric-name "$what" --statistic Average \
-              --dimensions Name=ClusterName,Value="${CLUSTER}" Name=ServiceName,Value="${SERVICE}" \
-              --threshold "$WARN" "${ARGS_COMMON[@]}" \
-              $( [[ -n "$SNS_TOPIC_ARN" ]] && echo --alarm-actions "$SNS_TOPIC_ARN" )
-
-            # alarm
-            A --alarm-name "${SERVICE}-${what,,}-alarm" \
-              --namespace AWS/ECS --metric-name "$what" --statistic Average \
-              --dimensions Name=ClusterName,Value="${CLUSTER}" Name=ServiceName,Value="${SERVICE}" \
-              --threshold "$ALRM" "${ARGS_COMMON[@]}" \
-              $( [[ -n "$SNS_TOPIC_ARN" ]] && echo --alarm-actions "$SNS_TOPIC_ARN" )
-          done
-
-      # (facultatif) Health check HTTP avec retries
-      - name: Smoke test /health (optional)
-        if: ${{ env.HEALTH_URL != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          URL="${HEALTH_URL}"
-          echo "Health URL: $URL"
-          for i in {1..10}; do
-            echo "Try $i/10 ..."
-            if curl -sfS --max-time 5 "$URL" | jq -e '.ok == true' >/dev/null 2>&1; then
-              echo "Health OK ✅"
-              exit 0
-            fi
-            sleep 6
-          done
-          echo "Health check FAILED ❌"
-          exit 1
-
-      # (facultatif) Logs Insights: liste les dernières erreurs sur 15 minutes
-      - name: CloudWatch Logs Insights (optional)
-        if: ${{ env.LOG_GROUP != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          START=$(date -u -d '15 minutes ago' +%s)
-          END=$(date -u +%s)
-          Q='fields @timestamp, @message
-             | filter @message like /(?i)(ERROR|Exception|Task timed out|5\d\d)/
-             | sort @timestamp desc
-             | limit 20'
-          QID=$(aws logs start-query \
-              --log-group-name "$LOG_GROUP" \
-              --start-time $START --end-time $END \
-              --query-string "$Q" --query 'queryId' --output text)
-          for _ in {1..20}; do
-            S=$(aws logs get-query-results --query-id "$QID" --query 'status' --output text)
-            [[ "$S" == "Complete" ]] && break
-            sleep 2
-          done
-          echo "### Logs Insights — dernières erreurs (15 min)" >> "$GITHUB_STEP_SUMMARY"
-          aws logs get-query-results --query-id "$QID" \
-            | jq -r '.results[] | map(.field + ": " + .value) | join(" | ")' \
-            | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
-
-      # Résumé Monitoring dans l’onglet Summary
-      - name: Monitoring summary
-        if: always()
-        shell: bash
+      # Création/MàJ des alarmes CloudWatch (ECS + ALB si présent)
+      - name: Create/Update CloudWatch alarms
         env:
-          LB_DIM: ${{ steps.discover.outputs.lb_dim }}
-          TG_DIM: ${{ steps.discover.outputs.tg_dim }}
+          SNS_TOPIC_ARN: ${{ secrets.ALARM_SNS_ARN }}   # optionnel
         run: |
+          set -euo pipefail
+
+          SERVICE="${SERVICE}"
+          CLUSTER="${CLUSTER}"
+          REGION="${AWS_REGION}"
+
+          # Wrapper
+          A=(aws cloudwatch put-metric-alarm --region "${REGION}")
+
+          # Période et fenêtres communes (5 minutes)
+          ARGS_COMMON=(
+            --evaluation-periods 1
+            --period 300
+            --treat-missing-data notBreaching
+            --comparison-operator GreaterThanThreshold
+            --alarm-description "Auto-created by GitHub Actions (ECS deploy)."
+            --actions-enabled
+          )
+
+          # --- Alarme CPU ECS (Average) ---
+          "${A[@]}" \
+            --alarm-name "${SERVICE}-cpu-high" \
+            --namespace "AWS/ECS" \
+            --metric-name "CPUUtilization" \
+            --statistic Average \
+            --threshold "${CPU_ALARM}" \
+            --dimensions Name=ClusterName,Value="${CLUSTER}" Name=ServiceName,Value="${SERVICE}" \
+            "${ARGS_COMMON[@]}" \
+            $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+
+          # --- Alarme Mémoire ECS (Average) ---
+          "${A[@]}" \
+            --alarm-name "${SERVICE}-mem-high" \
+            --namespace "AWS/ECS" \
+            --metric-name "MemoryUtilization" \
+            --statistic Average \
+            --threshold "${MEM_ALARM}" \
+            --dimensions Name=ClusterName,Value="${CLUSTER}" Name=ServiceName,Value="${SERVICE}" \
+            "${ARGS_COMMON[@]}" \
+            $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+
+          # --- Alarme DesiredCount == 0 (optionnelle) ---
+          "${A[@]}" \
+            --alarm-name "${SERVICE}-desiredcount-zero" \
+            --namespace "AWS/ECS" \
+            --metric-name "RunningTaskCount" \
+            --comparison-operator LessThanThreshold \
+            --threshold 1 \
+            --statistic Minimum \
+            --dimensions Name=ClusterName,Value="${CLUSTER}" Name=ServiceName,Value="${SERVICE}" \
+            --evaluation-periods 1 --period 60 \
+            --treat-missing-data breaching \
+            --alarm-description "No task running for ${SERVICE}" \
+            $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+
+          # --- Alarme ALB / TargetGroup (si découverts) ---
+          if [[ "${{ steps.discover.outputs.has_alb }}" == "true" ]]; then
+            LB_DIM='${{ steps.discover.outputs.lb_dim }}'
+            TG_DIM='${{ steps.discover.outputs.tg_dim }}'
+
+            # 5xx cibles (sum / 5min)
+            "${A[@]}" \
+              --alarm-name "${SERVICE}-tg5xx" \
+              --namespace "AWS/ApplicationELB" \
+              --metric-name "HTTPCode_Target_5XX_Count" \
+              --statistic Sum \
+              --threshold "${TG_5XX_THRESHOLD}" \
+              --dimensions Name=LoadBalancer,Value="${LB_DIM}" Name=TargetGroup,Value="${TG_DIM}" \
+              "${ARGS_COMMON[@]}" \
+              $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+
+            # 5xx ELB (sum / 5min)
+            "${A[@]}" \
+              --alarm-name "${SERVICE}-elb5xx" \
+              --namespace "AWS/ApplicationELB" \
+              --metric-name "HTTPCode_ELB_5XX_Count" \
+              --statistic Sum \
+              --threshold "${ELB_5XX_THRESHOLD}" \
+              --dimensions Name=LoadBalancer,Value="${LB_DIM}" \
+              "${ARGS_COMMON[@]}" \
+              $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+
+            # Latence p95 (TargetResponseTime)
+            "${A[@]}" \
+              --alarm-name "${SERVICE}-latency-p95" \
+              --namespace "AWS/ApplicationELB" \
+              --metric-name "TargetResponseTime" \
+              --extended-statistic p95 \
+              --threshold "${LATENCY_P95_SEC}" \
+              --dimensions Name=LoadBalancer,Value="${LB_DIM}" Name=TargetGroup,Value="${TG_DIM}" \
+              "${ARGS_COMMON[@]}" \
+              $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+
+            # Cibles non saines (Maximum)
+            "${A[@]}" \
+              --alarm-name "${SERVICE}-unhealthy-hosts" \
+              --namespace "AWS/ApplicationELB" \
+              --metric-name "UnHealthyHostCount" \
+              --statistic Maximum \
+              --threshold "${UNHEALTHY_HOSTS}" \
+              --dimensions Name=TargetGroup,Value="${TG_DIM}" Name=LoadBalancer,Value="${LB_DIM}" \
+              "${ARGS_COMMON[@]}" \
+              $( [[ -n "${SNS_TOPIC_ARN:-}" ]] && echo --alarm-actions "${SNS_TOPIC_ARN}" )
+          else
+            echo "No ALB/TargetGroup discovered for ${SERVICE} — skipping ALB alarms."
+          fi
+
+      # Tableau de bord CloudWatch minimal
+      - name: Create/Update CloudWatch dashboard
+        run: |
+          set -euo pipefail
+          DASH="ECS-${SERVICE}"
+          aws cloudwatch put-dashboard --dashboard-name "$DASH" --dashboard-body "$(cat <<'JSON'
           {
-            echo "## ECS Deploy & Monitoring"
-            echo ""
-            echo "- **Cluster/Service**: \`${{ env.CLUSTER }} / ${{ env.SERVICE }}\`"
-            echo "- **Region**: \`${{ env.AWS_REGION }}\`"
-            if [[ -n "${LB_DIM:-}" && -n "${TG_DIM:-}" ]]; then
-              echo "- **ALB**: \`${LB_DIM}\`"
-              echo "- **Target Group**: \`${TG_DIM}\`"
-            else
-              echo "- **ALB/TargetGroup**: *(non détectés)*"
-            fi
-            echo ""
-            echo "### Seuils d'alarme"
-            echo "- ALB Target 5xx > ${{ env.TG_5XX_THRESHOLD }} / ${{
-              env.ALARM_WINDOW_SEC }}s"
-            echo "- Latence p95 > ${{ env.LATENCY_P95_SEC }}s"
-            echo "- Unhealthy hosts > ${{ env.UNHEALTHY_HOSTS }}"
-            echo "- CPU warn/alarm: ${{ env.CPU_WARN }} / ${{ env.CPU_ALARM }} %"
-            echo "- Mem warn/alarm: ${{ env.MEM_WARN }} / ${{ env.MEM_ALARM }} %"
-            if [[ -n "${{ env.HEALTH_URL }}" ]]; then
-              echo ""
-              echo "### Health URL"
-              echo "${{ env.HEALTH_URL }}"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+            "widgets": [
+              {
+                "type": "metric",
+                "width": 12, "height": 6, "x": 0, "y": 0,
+                "properties": {
+                  "region": "${AWS_REGION}",
+                  "title": "ECS CPU / Memory",
+                  "metrics": [
+                    [ "AWS/ECS", "CPUUtilization", "ClusterName", "${CLUSTER}", "ServiceName", "${SERVICE}", { "stat": "Average" } ],
+                    [ ".", "MemoryUtilization", ".", ".", ".", ".", { "stat": "Average", "yAxis": "right" } ]
+                  ],
+                  "yAxis": { "left": { "label": "CPU %"}, "right": { "label": "Mem %" } },
+                  "period": 300,
+                  "stacked": false,
+                  "view": "timeSeries"
+                }
+              }
+            ]
+          }
+          JSON
+          )"
+          echo "Dashboard updated: https://${AWS_REGION}.console.aws.amazon.com/cloudwatch/home?region=${AWS_REGION}#dashboards:name=${DASH}"
