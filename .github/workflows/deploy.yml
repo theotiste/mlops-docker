@@ -17,7 +17,7 @@ jobs:
     env:
       AWS_REGION:           ${{ vars.AWS_REGION || 'eu-west-3' }}
       CLUSTER:              ${{ vars.ECS_CLUSTER || 'mlops-cluster' }}
-      SERVICE:              ${{ vars.ECS_SERVICE || 'mlops-service' }}
+      SERVICE:              ${{ vars.ECS_SERVICE || 'mlops--service' }}
       TASK_DEF_FILE:        ${{ vars.ECS_TASK_DEF_FILE || 'task-definition.json' }}
 
       # URL de santé exposée par ton service derrière l’ALB (facultatif mais conseillé)
